@@ -11,6 +11,7 @@
 #include "hough_voting_gpu_op.h"
 
 #define VERTEX_CHANNELS 3
+#define MAX_ROI 128
 
 #define CUDA_1D_KERNEL_LOOP(i, n)                            \
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; \
@@ -80,7 +81,7 @@ __device__ inline float IoU(float* a, float* b)
   return interS / (Sa + Sb - interS);
 }
 
-__device__ inline void project_box(int cls, const float* extents, const float* meta_data, float distance, float* threshold)
+__device__ inline void project_box(int cls, const float* extents, const float* meta_data, float distance, float factor, float* threshold)
 {
   float xHalf = extents[cls * 3 + 0] * 0.5;
   float yHalf = extents[cls * 3 + 1] * 0.5;
@@ -115,7 +116,7 @@ __device__ inline void project_box(int cls, const float* extents, const float* m
   }
   float width = maxX - minX + 1;
   float height = maxY - minY + 1;
-  *threshold = fmax(width, height) * 0.6;
+  *threshold = fmax(width, height) * factor;
 }
 
 
@@ -185,7 +186,7 @@ __global__ void compute_arrays_kernel(const int nthreads, const int* labelmap,
   }
 }
 
-
+/*
 __global__ void compute_hough_kernel(const int nthreads, float* hough_space, float* hough_data, const int* labelmap, 
     const float* vertmap, const float* extents, const float* meta_data, int* arrays, int* array_size, 
     int* class_indexes, const int height, const int width, const int num_classes, const int count, const float inlierThreshold, const int skip_pixels) 
@@ -221,7 +222,7 @@ __global__ void compute_hough_kernel(const int nthreads, float* hough_space, flo
       if (angle_distance(cx, cy, x, y, u, v) > inlierThreshold)
       // if (point2line(cx, cy, x, y, u, v) < 1 && angle_distance_label(cx, cy, x, y, u, v, cls, height, width, labelmap) > 0)
       {
-        project_box(cls, extents, meta_data, d, &threshold);
+        project_box(cls, extents, meta_data, d, 0.6, &threshold);
         float dx = fabsf(x - cx);
         float dy = fabsf(y - cy);
         if (dx < threshold && dy < threshold)
@@ -247,9 +248,92 @@ __global__ void compute_hough_kernel(const int nthreads, float* hough_space, flo
   }
 }
 
+*/
 
-__global__ void compute_max_indexes_kernel(const int nthreads, int* max_indexes, int* num_max, float* hough_space, 
-  int height, int width, float threshold)
+__global__ void compute_hough_kernel(const int nthreads, float* hough_space, float* hough_data, const int* labelmap, 
+    const float* vertmap, const float* extents, const float* meta_data, int* arrays, int* array_size, 
+    int* class_indexes, const int height, const int width, const int num_classes, const int count, const float inlierThreshold, const int skip_pixels) 
+{
+  CUDA_1D_KERNEL_LOOP(index, nthreads) 
+  {
+    // (cls, cx, cy) is an element in the hough space
+    int ind = index / (height * width);
+    int cls = class_indexes[ind];
+    int n = index % (height * width);
+    int cx = n % width;
+    int cy = n / width;
+    int size = array_size[cls];
+    float distance = 0;
+    float threshold;
+
+    for (int i = 0; i < size; i += skip_pixels)
+    {
+      int offset = cls * height * width + i;
+      int location = arrays[offset];
+      int x = location % width;
+      int y = location / width;
+
+      // read the direction
+      offset = VERTEX_CHANNELS * cls + VERTEX_CHANNELS * num_classes * (y * width + x);
+      float u = vertmap[offset];
+      float v = vertmap[offset + 1];
+      float d = exp(vertmap[offset + 2]);
+
+      // vote
+      if (angle_distance(cx, cy, x, y, u, v) > inlierThreshold)
+      {
+        project_box(cls, extents, meta_data, d, 0.6, &threshold);
+        float dx = fabsf(x - cx);
+        float dy = fabsf(y - cy);
+        if (dx < threshold && dy < threshold)
+        {
+          hough_space[index]++;
+          distance += d;
+        }
+      }
+    }
+
+    if (hough_space[index] > 0)
+    {
+      distance /= hough_space[index];
+
+      float bb_width = -1;
+      float bb_height = -1;
+      for (int i = 0; i < size; i += skip_pixels)
+      {
+        int offset = cls * height * width + i;
+        int location = arrays[offset];
+        int x = location % width;
+        int y = location / width;
+
+        // read the direction
+        offset = VERTEX_CHANNELS * cls + VERTEX_CHANNELS * num_classes * (y * width + x);
+        float u = vertmap[offset];
+        float v = vertmap[offset + 1];
+
+        // vote
+        if (angle_distance(cx, cy, x, y, u, v) > inlierThreshold)
+        {
+          project_box(cls, extents, meta_data, distance, 0.6, &threshold);
+          float dx = fabsf(x - cx);
+          float dy = fabsf(y - cy);
+          if (dx > bb_width && dx < threshold && dy < threshold)
+            bb_width = dx;
+          if (dy > bb_height && dx < threshold && dy < threshold)
+            bb_height = dy;
+        }
+      }
+
+      int offset = ind * height * width * 3 + 3 * (cy * width + cx);
+      hough_data[offset] = distance;
+      hough_data[offset + 1] = 2 * bb_height;
+      hough_data[offset + 2] = 2 * bb_width;
+    }
+  }
+}
+
+__global__ void compute_max_indexes_kernel(const int nthreads, int* max_indexes, int index_size, int* num_max, float* hough_space, 
+  float* hough_data, int height, int width, float threshold, float perThreshold)
 {
   CUDA_1D_KERNEL_LOOP(index, nthreads) 
   {
@@ -260,7 +344,11 @@ __global__ void compute_max_indexes_kernel(const int nthreads, int* max_indexes,
     int cy = n / width;
     int kernel_size = 3;
 
-    if (hough_space[index] > threshold)
+    int offset = ind * height * width * 3 + 3 * (cy * width + cx);
+    float bb_height = hough_data[offset + 1];
+    float bb_width = hough_data[offset + 2];
+
+    if (hough_space[index] > threshold && bb_height > 0 && bb_width > 0)
     {
       // check if the location is local maximum
       int flag = 0;
@@ -277,13 +365,18 @@ __global__ void compute_max_indexes_kernel(const int nthreads, int* max_indexes,
             }
           }
         }
+
+        // check the percentage of voting
+        if (hough_space[index] / (bb_height * bb_width) < perThreshold)
+          flag = 1;
       }
 
       if (flag == 0)
       {
         // add the location to max_indexes
         int max_index = atomicAdd(num_max, 1);
-        max_indexes[max_index] = index;
+        if (max_index < index_size)
+          max_indexes[max_index] = index;
       }
     }
   }
@@ -343,42 +436,34 @@ __global__ void compute_rois_kernel(const int nthreads, float* top_box, float* t
           top_domain[roi_index + i] = 0;
       }
 
-      // find the gt index
-      int gt_ind = -1;
+      // compute pose target
       for (int i = 0; i < num_gt; i++)
       {
         int gt_batch = int(gt[i * 13 + 0]);
         int gt_id = int(gt[i * 13 + 1]);
         if(cls == gt_id && batch_index == gt_batch)
         {
-          gt_ind = i;
-          break;
-        }
-      }
+          int gt_ind = i;
 
-      if (gt_ind != -1)
-      {
-        float overlap = compute_box_overlap(cls, extents, meta_data, gt + gt_ind * 13, top_box + roi_index * 7 + 2);
-        if (overlap > 0.2)
-        {
-          for (int i = 0; i < 9; i++)
+          float overlap = compute_box_overlap(cls, extents, meta_data, gt + gt_ind * 13, top_box + roi_index * 7 + 2);
+          if (overlap > 0.2)
           {
-            top_target[(roi_index + i) * 4 * num_classes + 4 * cls + 0] = gt[gt_ind * 13 + 6];
-            top_target[(roi_index + i) * 4 * num_classes + 4 * cls + 1] = gt[gt_ind * 13 + 7];
-            top_target[(roi_index + i) * 4 * num_classes + 4 * cls + 2] = gt[gt_ind * 13 + 8];
-            top_target[(roi_index + i) * 4 * num_classes + 4 * cls + 3] = gt[gt_ind * 13 + 9];
+            for (int j = 0; j < 9; j++)
+            {
+              top_target[(roi_index + j) * 4 * num_classes + 4 * cls + 0] = gt[gt_ind * 13 + 6];
+              top_target[(roi_index + j) * 4 * num_classes + 4 * cls + 1] = gt[gt_ind * 13 + 7];
+              top_target[(roi_index + j) * 4 * num_classes + 4 * cls + 2] = gt[gt_ind * 13 + 8];
+              top_target[(roi_index + j) * 4 * num_classes + 4 * cls + 3] = gt[gt_ind * 13 + 9];
 
-            top_weight[(roi_index + i) * 4 * num_classes + 4 * cls + 0] = 1;
-            top_weight[(roi_index + i) * 4 * num_classes + 4 * cls + 1] = 1;
-            top_weight[(roi_index + i) * 4 * num_classes + 4 * cls + 2] = 1;
-            top_weight[(roi_index + i) * 4 * num_classes + 4 * cls + 3] = 1;
+              top_weight[(roi_index + j) * 4 * num_classes + 4 * cls + 0] = 1;
+              top_weight[(roi_index + j) * 4 * num_classes + 4 * cls + 1] = 1;
+              top_weight[(roi_index + j) * 4 * num_classes + 4 * cls + 2] = 1;
+              top_weight[(roi_index + j) * 4 * num_classes + 4 * cls + 3] = 1;
+            }
+            break;
           }
         }
-        // else
-        //  printf("small overlap\n");
       }
-      // else
-      //  printf("no gt pose\n");
 
       // add jittering boxes
       float x1 = top_box[roi_index * 7 + 2];
@@ -493,7 +578,7 @@ __global__ void compute_rois_kernel(const int nthreads, float* top_box, float* t
 
 void reset_outputs(float* top_box, float* top_pose, float* top_target, float* top_weight, int* top_domain, int* num_rois, int num_classes)
 {
-  int num = 1024;
+  int num = MAX_ROI * 9;
   cudaMemset(top_box, 0, num * 7 * sizeof(float));
   cudaMemset(top_pose, 0, num * 7 * sizeof(float));
   cudaMemset(top_target, 0, num * 4 *num_classes * sizeof(float));
@@ -529,8 +614,9 @@ void set_gradients(float* top_label, float* top_vertex, int batch_size, int heig
 
 void HoughVotingLaucher(OpKernelContext* context,
     const int* labelmap, const float* vertmap, const float* extents, const float* meta_data, const float* gt,
-    const int batch_index, const int height, const int width, const int num_classes, const int num_gt, 
-    const int is_train, const float inlierThreshold, const int labelThreshold, const int votingThreshold, const int skip_pixels, 
+    const int batch_index, const int batch_size, const int height, const int width, const int num_classes, const int num_gt, 
+    const int is_train, const float inlierThreshold, const int labelThreshold, const float votingThreshold, const float perThreshold, 
+    const int skip_pixels, 
     float* top_box, float* top_pose, float* top_target, float* top_weight, int* top_domain, int* num_rois, const Eigen::GpuDevice& d)
 {
   const int kThreadsPerBlock = 1024;
@@ -644,13 +730,13 @@ void HoughVotingLaucher(OpKernelContext* context,
   if (cudaMemset(num_max, 0, sizeof(int)) != cudaSuccess)
     fprintf(stderr, "reset error\n");
 
-  dim = 1024;
+  int index_size = MAX_ROI / batch_size;
   TensorShape output_shape_max_indexes;
-  TensorShapeUtils::MakeShape(&dim, 1, &output_shape_max_indexes);
+  TensorShapeUtils::MakeShape(&index_size, 1, &output_shape_max_indexes);
   Tensor max_indexes_tensor;
   OP_REQUIRES_OK(context, context->allocate_temp(DT_INT32, output_shape_max_indexes, &max_indexes_tensor));
   int* max_indexes = max_indexes_tensor.flat<int>().data(); 
-  if (cudaMemset(max_indexes, 0, dim * sizeof(int)) != cudaSuccess)
+  if (cudaMemset(max_indexes, 0, index_size * sizeof(int)) != cudaSuccess)
     fprintf(stderr, "reset error\n");
 
   if (votingThreshold > 0)
@@ -658,7 +744,7 @@ void HoughVotingLaucher(OpKernelContext* context,
     output_size = count * height * width;
     compute_max_indexes_kernel<<<(output_size + kThreadsPerBlock - 1) / kThreadsPerBlock,
                        kThreadsPerBlock, 0, d.stream()>>>(
-      output_size, max_indexes, num_max, hough_space, height, width, votingThreshold);
+      output_size, max_indexes, index_size, num_max, hough_space, hough_data, height, width, votingThreshold, perThreshold);
     cudaThreadSynchronize();
   }
   else
@@ -684,13 +770,19 @@ void HoughVotingLaucher(OpKernelContext* context,
   // step 4: compute outputs
   int num_max_host;
   cudaMemcpy(&num_max_host, num_max, sizeof(int), cudaMemcpyDeviceToHost);
-  output_size = num_max_host;
-  compute_rois_kernel<<<(output_size + kThreadsPerBlock - 1) / kThreadsPerBlock,
-                       kThreadsPerBlock, 0, d.stream()>>>(
-      output_size, top_box, top_pose, top_target, top_weight, top_domain,
-      extents, meta_data, gt, hough_space, hough_data, max_indexes, class_indexes,
-      is_train, batch_index, height, width, num_classes, num_gt, num_rois);
-  cudaThreadSynchronize();
+  if (num_max_host >= index_size)
+    num_max_host = index_size;
+  // printf("num_max: %d\n", num_max_host);
+  if (num_max_host > 0)
+  {
+    output_size = num_max_host;
+    compute_rois_kernel<<<(output_size + kThreadsPerBlock - 1) / kThreadsPerBlock,
+                         kThreadsPerBlock, 0, d.stream()>>>(
+        output_size, top_box, top_pose, top_target, top_weight, top_domain,
+        extents, meta_data, gt, hough_space, hough_data, max_indexes, class_indexes,
+        is_train, batch_index, height, width, num_classes, num_gt, num_rois);
+    cudaThreadSynchronize();
+  }
   
   // clean up
   free(array_sizes_host);
